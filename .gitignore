@@ -1,0 +1,6 @@
+# System
+**/.DS_Store
+
+# Compile & Run
+/target
+/models
