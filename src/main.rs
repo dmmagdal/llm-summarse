@@ -1,14 +1,19 @@
 use anyhow::Result;
 use candle_core::{Device, Tensor, Result as OtherResult};
 use candle_transformers::generation::LogitsProcessor;
-use candle_transformers::models::quantized_llama::ModelWeights;
+// use candle_transformers::models::quantized_llama::ModelWeights;
+use candle_transformers::models::quantized_qwen2::ModelWeights;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
+// The GGUF repo hosts the quantized model weights
 const MODEL_ID: &str = "Qwen/Qwen2.5-3B-Instruct-GGUF";
 const MODEL_FILE: &str = "qwen2.5-3b-instruct-q4_k_m.gguf";
+
+// The base repo hosts the configuration and tokenizer files
+const TOKENIZER_REPO: &str = "Qwen/Qwen2.5-3B-Instruct";
 
 // Example alternatives:
 //
@@ -97,7 +102,8 @@ fn main() -> Result<()> {
     // -------------------------------------------------------------------------
     let api = Api::new()?;
     let repo = api.repo(Repo::new(
-        MODEL_ID.to_string(),
+        // MODEL_ID.to_string(),
+        TOKENIZER_REPO.to_string(),
         RepoType::Model,
     ));
 
@@ -114,7 +120,7 @@ fn main() -> Result<()> {
     let mut file = std::fs::File::open(&model_path)?;
     // let mut gguf_reader = candle_core::quantized::gguf_file::Reader::new(&mut file)?;
     let gguf_content = candle_core::quantized::gguf_file::Content::read(&mut file)?;
-    // let model = ModelWeights::from_gguf(&mut file, &device)?;
+    // let model = ModelWeights::from_gguf(&mut file, &device)?; 
     let mut model = ModelWeights::from_gguf(gguf_content, &mut file, &device)?;
 
     println!("Model loaded successfully.");
@@ -168,21 +174,50 @@ NVIDIA GPUs using CUDA, and Apple Silicon devices using Metal.
 
     println!("\nGenerating summary...\n");
 
-    for _ in 0..max_new_tokens {
-        let input = Tensor::new(&tokens[..], &device)?.unsqueeze(0)?;
+    // --- STEP A: PREFILL PHASE ---
+    // Pass the entire prompt token vector at index_pos = 0.
+    // This initial pass initializes and populates the model's attention KV caches.
+    let input = Tensor::new(&tokens[..], &device)?.unsqueeze(0)?;
+    let mut logits = model.forward(&input, 0)?;
 
-        let logits = model.forward(&input, tokens.len())?;
-
-        let logits = logits.squeeze(0)?;
-        let next_token = logits_processor.sample(&logits)?;
-
-        tokens.push(next_token);
-
-        // EOS token for many Qwen models
+    // Candle's quantized models internally slice the output matrix to return
+    // only the logits tensor for the final token. Squeeze the batch dimension.
+    let mut logits = logits.squeeze(0)?;
+    let mut next_token = logits_processor.sample(&logits)?;
+    tokens.push(next_token);
+    
+    // --- STEP B: DECODE PHASE ---
+    // For all subsequent tokens, feed ONLY the single, newly generated token.
+    // The index position must match the total historical token count before this step.
+    for _ in 0..(max_new_tokens - 1) {
+        // EOS token specific to Qwen template configurations (<|im_end|>)
         if next_token == 151645 {
             break;
         }
+
+        let input = Tensor::new(&[next_token], &device)?.unsqueeze(0)?;
+        logits = model.forward(&input, tokens.len() - 1)?;
+        logits = logits.squeeze(0)?;
+        
+        next_token = logits_processor.sample(&logits)?;
+        tokens.push(next_token);
     }
+
+    // for _ in 0..max_new_tokens {
+    //     let input = Tensor::new(&tokens[..], &device)?.unsqueeze(0)?;
+
+    //     let logits = model.forward(&input, tokens.len())?;
+
+    //     let logits = logits.squeeze(0)?;
+    //     let next_token = logits_processor.sample(&logits)?;
+
+    //     tokens.push(next_token);
+
+    //     // EOS token for many Qwen models
+    //     if next_token == 151645 {
+    //         break;
+    //     }
+    // }
 
     // -------------------------------------------------------------------------
     // 8. Decode output
